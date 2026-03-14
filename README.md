@@ -26,6 +26,8 @@ npm run dev
 
 To run the backend:
 
+Download poppler and Tesseract, and add them to path (in windows) for OCR
+
 ```sh
 # Step 1: Navigate to fast api folder
 cd api

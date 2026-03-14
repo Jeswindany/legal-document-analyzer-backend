@@ -8,6 +8,8 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+Run api/scripts/download_model.py from root folder to download the model required
+
 Run the server:
 
 ```bash

@@ -14,6 +14,9 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 import io
 import re
+import tempfile
+from PIL import Image, ImageFilter, ImageOps, ImageEnhance
+import logging
 
 # Optional dependencies for document extraction / OCR
 try:
@@ -127,43 +130,123 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
     paragraphs = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
     return "\n".join(paragraphs)
 
+logger = logging.getLogger(__name__)
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    # Try PyMuPDF text extraction first
-    if fitz is not None:
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            text_pages = [page.get_text("text") for page in doc]
-            full = "\n".join(p for p in text_pages if p and p.strip())
-            if full.strip():
-                return full
-        except Exception:
-            pass
+def extract_text_from_pdf(file_bytes: bytes, try_ocr: bool = True, ocr_kwargs: dict = None) -> str:
+    """
+    Try text extraction (PyMuPDF -> pdfplumber). If empty and try_ocr True, attempt OCR.
+    Returns extracted text (possibly empty). Raises no exception unless a real unexpected error occurs.
+    """
+    text = ""
 
-    # Fallback: try pdfplumber if installed (optional)
+    # 1) PyMuPDF (fast, if available)
     try:
-        import pdfplumber
-
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            pages = [page.extract_text() or "" for page in pdf.pages]
-            joined = "\n".join(p for p in pages if p and p.strip())
-            if joined.strip():
-                return joined
+        if fitz is not None:
+            try:
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                pages_text = [page.get_text("text") or "" for page in doc]
+                text = "\n".join(p for p in pages_text if p and p.strip())
+                if text.strip():
+                    return text
+            except Exception as e:
+                logger.debug("PyMuPDF extraction failed: %s", e)
     except Exception:
         pass
 
-    # If still empty, return empty string — caller may attempt OCR
+    # 2) pdfplumber (fallback)
+    try:
+        import pdfplumber
+        try:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                pages = [page.extract_text() or "" for page in pdf.pages]
+                joined = "\n".join(p for p in pages if p and p.strip())
+                if joined.strip():
+                    return joined
+        except Exception as e:
+            logger.debug("pdfplumber extraction failed: %s", e)
+    except Exception:
+        # pdfplumber not installed — that's fine
+        pass
+
+    # 3) OCR fallback (optional)
+    if try_ocr:
+        try:
+            ocr_kwargs = ocr_kwargs or {}
+            ocr_text = ocr_pdf_bytes(file_bytes, **ocr_kwargs)
+            return ocr_text
+        except Exception as e:
+            # bubble up a descriptive error for the caller to translate into HTTP error
+            logger.exception("OCR attempt failed: %s", e)
+            raise RuntimeError(f"OCR failed: {e}")
+
     return ""
 
 
-def ocr_pdf_bytes(file_bytes: bytes) -> str:
+def ocr_pdf_bytes(
+    file_bytes: bytes,
+    dpi: int = 300,
+    first_n_pages: Optional[int] = None,
+    poppler_path: Optional[str] = None,
+    tesseract_lang: str = "eng",
+    tesseract_config: str = "--oem 3 --psm 1",
+    preprocess: bool = True,
+    save_debug_image: bool = False,
+) -> str:
+    """
+    Convert PDF pages to images and OCR each image. Returns concatenated text.
+    - dpi: render DPI for pdf2image (higher -> better OCR but more memory)
+    - first_n_pages: if set, only OCR the first N pages (helps debug / speed)
+    - poppler_path: path to poppler binaries if not on PATH
+    - tesseract_lang: language code for Tesseract
+    - tesseract_config: extra config flags for pytesseract
+    - preprocess: simple image preprocessing (grayscale, despeckle, contrast)
+    - save_debug_image: if True, saves the first page image to a temp file and logs the path
+    """
     if convert_from_bytes is None or pytesseract is None:
-        raise RuntimeError("pdf2image and pytesseract are required for OCR of scanned PDFs (pip install pdf2image pytesseract)")
-    images = convert_from_bytes(file_bytes)
+        raise RuntimeError("pdf2image and pytesseract are required for OCR (install pdf2image and pytesseract)")
+
+    # render pages to PIL images
+    convert_kwargs = {"dpi": dpi}
+    if poppler_path:
+        convert_kwargs["poppler_path"] = poppler_path
+
+    images = convert_from_bytes(file_bytes, **convert_kwargs)
+
+    if not images:
+        return ""
+
     text_chunks = []
-    for img in images:
-        text_chunks.append(pytesseract.image_to_string(img))
-    return "\n".join(t.strip() for t in text_chunks if t and t.strip())
+    page_count = len(images)
+    limit = first_n_pages or page_count
+
+    for i, img in enumerate(images[:limit]):
+        try:
+            # Optional preprocessing
+            if preprocess:
+                # convert to grayscale
+                img = img.convert("L")
+                # small median filter to reduce noise
+                img = img.filter(ImageFilter.MedianFilter(size=3))
+                # increase contrast
+                enhancer = ImageEnhance.Contrast(img)
+                img = enhancer.enhance(1.3)
+
+            if save_debug_image and i == 0:
+                tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                img.save(tmpf.name, format="PNG")
+                logger.info("Saved debug OCR image to %s", tmpf.name)
+
+            # run tesseract
+            page_text = pytesseract.image_to_string(img, lang=tesseract_lang, config=tesseract_config)
+            page_text = page_text.strip()
+            if page_text:
+                text_chunks.append(page_text)
+        except Exception as e:
+            # log and continue with other pages
+            logger.exception("OCR failed on page %d: %s", i + 1, e)
+            continue
+
+    return "\n\n".join(text_chunks)
 
 
 # ── Clean / split text into meaningful segments ----------------
@@ -327,14 +410,14 @@ async def classify_clauses(
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
         elif filename.endswith('.pdf'):
-            # try text extraction
-            extracted_text = extract_text_from_pdf(contents)
+            extracted_text = extract_text_from_pdf(contents, try_ocr=False)
             if not extracted_text.strip():
-                # attempt OCR
+                # attempt OCR but catch descriptive errors
                 try:
-                    extracted_text = ocr_pdf_bytes(contents)
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"Failed OCR: {e}")
+                    extracted_text = extract_text_from_pdf(contents, try_ocr=True, ocr_kwargs={"dpi":300, "save_debug_image":True})
+                except RuntimeError as e:
+                    # return a helpful HTTP error
+                    raise HTTPException(status_code=500, detail=f"OCR failed: {e}. Make sure Tesseract and Poppler are installed on the host.")
         else:
             # try to treat as text fallback
             try:
