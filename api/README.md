@@ -13,7 +13,7 @@ Run api/scripts/download_model.py from root folder to download the model require
 Run the server:
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 ## Endpoints

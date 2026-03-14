@@ -51,11 +51,11 @@ except LookupError:
 router = APIRouter()
 
 # ── Model Loading ──────────────────────────────────────────────
-MODEL_PATH = "./routers/models/classifier"
+model_name = "jeswinpauldany/legalbert-clause-classifier"
 
 try:
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
     model.eval()
 except Exception as e:
     print(f"⚠️  Classifier model not loaded: {e}")
