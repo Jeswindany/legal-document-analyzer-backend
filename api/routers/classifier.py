@@ -51,11 +51,22 @@ except LookupError:
 router = APIRouter()
 
 # ── Model Loading ──────────────────────────────────────────────
-model_name = "jeswinpauldany/legalbert-clause-classifier"
+# MODEL_PATH = "./routers/models/classifier"
+MODEL_PATH = "jeswinpauldany/legalbert-clause-classifier" # <-- HuggingFace Hub model ID (replace with your own if needed)
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+if device.type == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 try:
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_PATH,
+        torch_dtype=torch.float32,  # <-- force FP32
+    )
+
+    model.to(device)
     model.eval()
 except Exception as e:
     print(f"⚠️  Classifier model not loaded: {e}")
@@ -184,7 +195,7 @@ def extract_text_from_pdf(file_bytes: bytes, try_ocr: bool = True, ocr_kwargs: d
 
 def ocr_pdf_bytes(
     file_bytes: bytes,
-    dpi: int = 300,
+    dpi: int = 200,
     first_n_pages: Optional[int] = None,
     poppler_path: Optional[str] = None,
     tesseract_lang: str = "eng",
@@ -332,54 +343,65 @@ def normalize_and_split(text: str) -> List[str]:
 
 # ── Inference helper -----------------------------------------
 
-def classify_segment(segment: str) -> Dict[str, Any]:
-
+def classify_segments_batch(segments: List[str], batch_size: int = 8) -> List[Dict[str, Any]]:
     if tokenizer is None or model is None:
         raise RuntimeError("Classifier model is not loaded")
 
-    inputs = tokenizer(
-        segment,
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
-        padding=True
-    )
+    results: List[Dict[str, Any]] = []
 
-    with torch.no_grad():
-        outputs = model(**inputs)
+    for start in range(0, len(segments), batch_size):
+        batch = segments[start:start + batch_size]
 
-    probs = torch.softmax(outputs.logits, dim=-1)
+        inputs = tokenizer(
+            batch,
+            return_tensors="pt",
+            truncation=True,
+            max_length=256,   # faster than 512; usually enough for clauses
+            padding=True
+        )
 
-    topk = torch.topk(probs, k=3)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    predicted_ids = topk.indices[0].tolist()
-    confidences = topk.values[0].tolist()
+        with torch.inference_mode():
+            if device.type == "cuda":
+                with torch.amp.autocast(device_type="cuda"):
+                    outputs = model(**inputs)
+            else:
+                outputs = model(**inputs)
 
-    label = None
-    confidence = None
+            probs = torch.softmax(outputs.logits, dim=-1)
+            topk = torch.topk(probs, k=3, dim=-1)
 
-    for i, pid in enumerate(predicted_ids):
-        candidate_label = id2label[pid]
-        category = map_label_to_category(candidate_label)
+        for i, segment in enumerate(batch):
+            predicted_ids = topk.indices[i].tolist()
+            confidences = topk.values[i].tolist()
 
-        if category != "other":
-            label = candidate_label
-            confidence = confidences[i]
-            break
+            label = None
+            confidence = None
 
-    if label is None:
-        label = id2label[predicted_ids[0]]
-        confidence = confidences[0]
+            for j, pid in enumerate(predicted_ids):
+                candidate_label = id2label[pid]
+                category = map_label_to_category(candidate_label)
 
-    category = map_label_to_category(label)
+                if category != "other":
+                    label = candidate_label
+                    confidence = confidences[j]
+                    break
 
-    return {
-        "clause_type": category,
-        "label": label,
-        "confidence": round(float(confidence), 4),
-        "text": segment
-    }
+            if label is None:
+                label = id2label[predicted_ids[0]]
+                confidence = confidences[0]
 
+            category = map_label_to_category(label)
+
+            results.append({
+                "clause_type": category,
+                "label": label,
+                "confidence": round(float(confidence), 4),
+                "text": segment
+            })
+
+    return results
 
 # ── Endpoint: accepts file (docx/pdf) or raw text --------------
 @router.post("/clauses")
@@ -414,7 +436,7 @@ async def classify_clauses(
             if not extracted_text.strip():
                 # attempt OCR but catch descriptive errors
                 try:
-                    extracted_text = extract_text_from_pdf(contents, try_ocr=True, ocr_kwargs={"dpi":300, "save_debug_image":True})
+                    extracted_text = extract_text_from_pdf(contents, try_ocr=True, ocr_kwargs={"dpi":200, "save_debug_image":False})
                 except RuntimeError as e:
                     # return a helpful HTTP error
                     raise HTTPException(status_code=500, detail=f"OCR failed: {e}. Make sure Tesseract and Poppler are installed on the host.")
@@ -445,17 +467,13 @@ async def classify_clauses(
 
     total_found = 0
 
-    for seg in segments:
-        try:
-            r = classify_segment(seg)
-        except Exception as e:
-            # skip segment on classification error but continue
-            continue
+    batch_size = 4 if device.type == "cuda" else 16
+    classified_segments = classify_segments_batch(segments, batch_size=batch_size)
 
+    for r in classified_segments:
         if r["confidence"] < threshold:
             continue
 
-        # decide category
         category = r["clause_type"]
 
         if category in grouped:
